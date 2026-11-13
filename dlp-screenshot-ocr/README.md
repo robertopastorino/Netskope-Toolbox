@@ -265,6 +265,8 @@ Formati immagine supportati: `png`, `jpg`, `jpeg`, `bmp`, `tif`, `tiff`, `webp`.
 | `--min-len` | `3` | Lunghezza minima dei termini di una parola |
 | `--max-digit-ratio` | `0.3` | Quota massima di cifre in un token: scarta valori e codici, tiene le etichette |
 | `--min-images` | `2` | Un termine entra in `dizionario.txt` solo se compare in almeno N immagini |
+| `--no-collapse` | off | Tiene anche i termini che compaiono solo come parte di un termine più lungo |
+| `--collapse-min` | `1` | Un termine contenuto in uno più lungo resta in `dizionario.txt` solo se compare da solo, come intero segmento, almeno N volte |
 | `--stopwords` | – | File con stopword aggiuntive, una per riga |
 
 ### Dati personali
@@ -273,7 +275,7 @@ Formati immagine supportati: `png`, `jpg`, `jpeg`, `bmp`, `tif`, `tiff`, `webp`.
 |---|---|---|
 | `--names` | – | Elenco di nomi e/o cognomi, uno per riga (ripetibile) |
 | `--names-vocab` | – | Vocabolario di parole comuni (ripetibile): i nomi presenti anche qui sono considerati ambigui |
-| `--keep` | – | Termini da non trattare mai come nomi, es. etichette del gestionale (ripetibile) |
+| `--keep` | – | Etichette da tenere sempre: mai trattate come nomi e mai assorbite in termini più lunghi (ripetibile) |
 | `--ignore` | – | Termini da escludere sempre; supporta frasi e regex `re:` (ripetibile) |
 | `--review-names` | off | Scrive `scartati_nomi_da_verificare.csv` per la revisione dei falsi positivi |
 | `--no-redact` | off | Non oscura i dati personali nel testo per immagine |
@@ -326,8 +328,8 @@ Con `--mode struttura` o `--mode dizionario` i rispettivi file finiscono diretta
 | `ocr_cache.jsonl.gz` | Risultato grezzo dell'OCR (parole, confidenza, posizione) per la [seconda passata](#seconda-passata-dalla-cache). **Testo non oscurato** |
 | `ocr_report.csv` | Per ogni immagine: ambito, parole riconosciute, confidenza media, se è stata invertita, eventuali errori. Serve a capire su quali schermate l'OCR rende male |
 | `*.png.txt` | Testo riconosciuto, riga per riga, con i dati personali oscurati (`[CF]`, `[EMAIL]`, `[NOME]`, `[IGNORATO]`) salvo `--no-redact`. Il nome conserva l'estensione originale per evitare collisioni (`a.png` e `a.jpg`) |
-| `dizionario_termini.csv` | Un termine per riga con: numero di parole, immagini e ambiti in cui compare, elenco ambiti, ambito di esclusività, occorrenze, confidenza media, file di esempio |
-| `dizionario.txt` | Termini presenti in almeno `--min-images` immagini, uno per riga |
+| `dizionario_termini.csv` | Tutti i termini, compresi quelli inclusi in termini più lunghi, con: numero di parole, immagini e ambiti in cui compare, elenco ambiti, ambito di esclusività, occorrenze, occorrenze isolate, termine in cui è incluso, confidenza media, file di esempio |
+| `dizionario.txt` | Termini presenti in almeno `--min-images` immagini e non inclusi in termini più lunghi, uno per riga |
 | `per_ambito\<ambito>.txt` | Termini trovati in quell'ambito |
 | `per_ambito\<ambito>_esclusivi.txt` | Termini che compaiono **solo** in quell'ambito |
 | `scartati_riepilogo.csv` | Numero di termini scartati per motivo (`codice_fiscale`, `email`, `lista_esclusione`, `nome`), senza i termini stessi |
@@ -350,6 +352,35 @@ L'**ambito** è la cartella di primo livello sotto `--input`; i file direttament
    - i termini singoli più corti di `--min-len` o presenti nelle stopword;
    - le frasi che iniziano o finiscono con una stopword.
 6. I termini vengono aggregati senza distinzione tra maiuscole e minuscole; nei file di output compare la forma più frequente.
+7. I termini che compaiono solo come parte di un termine più lungo vengono esclusi da `dizionario.txt` (vedi sotto).
+
+### Termini inclusi in termini più lunghi
+
+Estraendo tutte le frasi fino a `--ngram-max` parole, un'etichetta come `RISPOSTA PEC GENERICA` genera anche `RISPOSTA`, `RISPOSTA PEC`, `PEC`, `PEC GENERICA` e `GENERICA`, che non esistono come etichette autonome.
+
+Per distinguerli, lo script conta per ogni termine le **occorrenze isolate**: quelle in cui il termine occupa da solo un intero segmento (una riga dell'OCR, spezzata sui separatori e dopo i `:`). Un termine contenuto in un termine più lungo del dizionario viene escluso da `dizionario.txt` se non compare mai isolato (soglia `--collapse-min`). Esempio:
+
+| Termine | Occorrenze | Isolate | Esito |
+|---|---|---|---|
+| `RISPOSTA PEC GENERICA` | 3 | 3 | tenuto |
+| `RISPOSTA PEC` | 3 | 0 | incluso in `RISPOSTA PEC GENERICA` |
+| `RISPOSTA` | 6 | 3 | tenuto: compare anche da solo in altre schermate |
+
+I termini esclusi restano in `dizionario_termini.csv` con la colonna `incluso_in`, per la revisione.
+
+Casi da controllare:
+
+- **Etichetta seguita da un valore testuale senza `:`** (es. `STATO APERTO`, `STATO CHIUSO`): `STATO` non compare mai isolato e viene assorbito, mentre restano le combinazioni con il valore. Aggiungi l'etichetta al file `--keep`, che la esenta da questo meccanismo.
+- **Etichette più lunghe di `--ngram-max` parole:** nessun termine copre l'intera etichetta, quindi restano più frasi sovrapposte. Alza `--ngram-max` alla lunghezza dell'etichetta più lunga.
+- **OCR che spezza un'etichetta su due righe:** i pezzi risultano isolati e vengono tenuti. Si vede dalla colonna `occorrenze_isolate`.
+
+Il meccanismo si disattiva con `--no-collapse` e si può tarare dalla cache, senza rifare l'OCR.
+
+### Apostrofi
+
+Gli apostrofi tipografici (`’`, `‘`, `` ` ``, `´`) vengono convertiti in `'`, così `ATTIVITA’` e `ATTIVITA'` diventano lo stesso termine. L'apostrofo finale dopo una vocale viene mantenuto, perché nei gestionali sostituisce l'accento sulle maiuscole (`ATTIVITA'` = `ATTIVITÀ`), tranne quando la parola è tra virgolette.
+
+Non è stato verificato come il motore OCR del DLP renda l'apostrofo, né come il dizionario del DLP lo tratti in fase di confronto: va testato prima di usare in una regola termini che lo contengono.
 
 Interpretazione utile per il DLP:
 
@@ -500,6 +531,8 @@ Linee guida per la taratura:
 - **Temi scuri non rilevati:** forza `--invert always` su quella cartella.
 - **Layout a blocchi (report, stampe):** prova `--psm 6` o `--psm 3`.
 - **Troppi termini spazzatura:** alza `--min-conf` (es. 75) e `--min-images`.
+- **Pezzi di etichette nel dizionario** (es. `RISPOSTA PEC` accanto a `RISPOSTA PEC GENERICA`): controlla che `--ngram-max` copra le etichette più lunghe.
+- **Etichetta sparita perché assorbita in combinazioni con valori** (es. `STATO` in `STATO APERTO`): aggiungila al file `--keep`.
 - **Etichette del gestionale sparite dal dizionario:** rilancia con `--review-names` e aggiungi i falsi positivi a `keep_etichette_gestionali.txt`.
 - **Etichette ripetute ma poco utili** (es. "Salva", "Annulla", "Chiudi"): mettile in un file e passalo con `--stopwords`.
 
