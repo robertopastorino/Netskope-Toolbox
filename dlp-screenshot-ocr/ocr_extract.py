@@ -75,6 +75,21 @@ STOPWORDS = {
     "is", "are", "be", "this", "that", "it", "as", "not",
 }
 TRIM_CHARS = " \t.,;:!?()[]{}<>\"'«»|*_=+-–—/\\…"
+APOSTROPHES = str.maketrans({"\u2019": "'", "\u2018": "'", "`": "'", "\u00b4": "'"})
+
+
+def clean_token(raw):
+    """Normalizza gli apostrofi tipografici e toglie la punteggiatura ai bordi,
+    mantenendo l'apostrofo finale usato al posto dell'accento sulle maiuscole
+    (es. ATTIVITA' = ATTIVITÀ), così ATTIVITA’ e ATTIVITA' diventano lo stesso termine."""
+    norm = raw.translate(APOSTROPHES)
+    t = norm.lstrip(TRIM_CHARS)
+    core = t.rstrip(TRIM_CHARS)
+    quoted = norm[:1] in "'\"«"  # 'Salva' tra virgolette: l'apostrofo finale non è un accento
+    if (not quoted and len(core) < len(t) and t[len(core)] == "'"
+            and core[-1:].lower() in "aeiou"):
+        core += "'"
+    return core
 
 
 # ---------------------------------------------------------------------------
@@ -208,7 +223,7 @@ class PiiFilter:
     def redact(self, raw_tokens):
         """Restituisce i token della riga con i dati personali sostituiti."""
         out = list(raw_tokens)
-        low = [t.strip(TRIM_CHARS).lower() for t in raw_tokens]
+        low = [clean_token(t).lower() for t in raw_tokens]
         n = len(low)
         for i, t in enumerate(raw_tokens):
             if has_cf(t):
@@ -363,8 +378,8 @@ def token_ok(tok, max_digit_ratio):
 
 
 def extract_terms(lines, a):
-    """Restituisce (chiave_lower, forma_originale, conf_media, motivo_scarto) per
-    unigrammi e n-grammi; motivo_scarto è None per i termini validi."""
+    """Restituisce (chiave_lower, forma_originale, conf_media, motivo_scarto, isolato)
+    per unigrammi e n-grammi; motivo_scarto è None per i termini validi."""
     for line in lines:
         for toks in split_segments(line):
             yield from _terms_in_segment(toks, a)
@@ -375,7 +390,7 @@ def split_segments(line):
     (fine etichetta), così gli n-grammi non scavalcano campi diversi."""
     seg, out = [], []
     for w in line:
-        t = w["text"].strip(TRIM_CHARS)
+        t = clean_token(w["text"])
         if not t:
             if seg:
                 out.append(seg)
@@ -391,6 +406,8 @@ def split_segments(line):
 
 
 def _terms_in_segment(toks, a):
+    """Per ogni termine indica anche se occupa l'intero segmento (occorrenza isolata):
+    serve a distinguere un'etichetta autonoma da un pezzo di un'etichetta più lunga."""
     mask = a.pii.name_mask([t.lower() for t, _ in toks])
     for size in range(1, a.ngram_max + 1):
         for i in range(len(toks) - size + 1):
@@ -402,7 +419,7 @@ def _terms_in_segment(toks, a):
             conf = sum(c for _, c in chunk) / size
             reason = a.pii.check(low, any(mask[i:i + size]))
             if reason:
-                yield " ".join(low), " ".join(ws), conf, reason
+                yield " ".join(low), " ".join(ws), conf, reason, False
                 continue
             if not all(token_ok(w, a.max_digit_ratio) for w in ws):
                 continue
@@ -414,7 +431,7 @@ def _terms_in_segment(toks, a):
                     continue
                 if len(ws[0]) < 2 or len(ws[-1]) < 2:
                     continue
-            yield " ".join(low), " ".join(ws), conf, None
+            yield " ".join(low), " ".join(ws), conf, None, size == len(toks)
 
 
 # ---------------------------------------------------------------------------
@@ -505,20 +522,49 @@ def write_pii_report(dropped, out_root: Path, min_images: int, review: bool):
     return len(review)
 
 
+def collapse_subterms(stats, min_standalone: int, keep_single=(), keep_phrases=()):
+    """Marca come 'inclusi' i termini che compaiono solo come parte di un termine più
+    lungo presente nel dizionario (es. 'risposta' e 'risposta pec' rispetto a
+    'risposta pec generica'). Un termine resta autonomo se compare da solo, come
+    intero segmento, almeno min_standalone volte, oppure se è nel file --keep.
+    Restituisce il numero di inclusi."""
+    supers = {}
+    for key in stats:
+        toks = key.split(" ")
+        n = len(toks)
+        for size in range(1, n):
+            for i in range(n - size + 1):
+                supers.setdefault(" ".join(toks[i:i + size]), []).append(key)
+    n_coll = 0
+    for key, s in stats.items():
+        cand = supers.get(key)
+        if not cand or s["standalone"] >= min_standalone:
+            continue
+        if key in keep_single or tuple(key.split(" ")) in keep_phrases:
+            continue
+        best = max(cand, key=lambda k: (len(k.split(" ")), len(stats[k]["images"]), stats[k]["count"]))
+        s["included_in"] = stats[best]["display"].most_common(1)[0][0]
+        n_coll += 1
+    return n_coll
+
+
 def write_dictionary(stats, out_root: Path, min_images: int):
     out_root.mkdir(parents=True, exist_ok=True)
     rows = sorted(stats.items(), key=lambda kv: (-len(kv[1]["images"]), -kv[1]["count"], kv[0]))
 
     with open(out_root / "dizionario_termini.csv", "w", newline="", encoding="utf-8-sig") as fh:
         wr = csv.writer(fh, delimiter=";")  # ';' per Excel in locale italiano
-        wr.writerow(["termine", "n_parole", "n_immagini", "n_ambiti", "ambiti",
-                     "esclusivo_di", "occorrenze", "conf_media", "esempio"])
+        wr.writerow(["termine", "n_parole", "n_immagini", "n_ambiti", "ambiti", "esclusivo_di",
+                     "occorrenze", "occorrenze_isolate", "incluso_in", "conf_media", "esempio"])
         for key, s in rows:
             amb = sorted(s["ambiti"])
             wr.writerow([s["display"].most_common(1)[0][0], len(key.split()), len(s["images"]),
                          len(amb), "|".join(amb), amb[0] if len(amb) == 1 else "",
-                         s["count"], f'{s["conf_sum"] / s["count"]:.1f}', s["example"]])
+                         s["count"], s["standalone"], s.get("included_in", ""),
+                         f'{s["conf_sum"] / s["count"]:.1f}', s["example"]])
 
+    # i termini inclusi in uno più lungo restano solo nel CSV, per la revisione
+    rows = [(k, s) for k, s in rows if "included_in" not in s]
     selected = [s["display"].most_common(1)[0][0] for _, s in rows if len(s["images"]) >= min_images]
     (out_root / "dizionario.txt").write_text("\n".join(selected) + "\n", encoding="utf-8")
 
@@ -574,6 +620,12 @@ def parse_args():
                    help="Quota massima di cifre in un token (scarta valori/dati, tiene le etichette)")
     d.add_argument("--min-images", type=int, default=2,
                    help="Un termine entra in dizionario.txt solo se presente in almeno N immagini")
+    d.add_argument("--no-collapse", action="store_true",
+                   help="Tieni anche i termini che compaiono solo come parte di un termine più lungo "
+                        "(es. 'Risposta PEC' dentro 'Risposta PEC generica')")
+    d.add_argument("--collapse-min", type=int, default=1,
+                   help="Un termine contenuto in uno più lungo resta nel dizionario solo se compare "
+                        "da solo, come intero segmento, almeno N volte")
     d.add_argument("--stopwords", dest="stopwords_file", help="File con stopword aggiuntive, una per riga")
 
     f = p.add_argument_group("Filtri dati personali",
@@ -584,7 +636,8 @@ def parse_args():
                    help="Vocabolario di parole comuni (ripetibile): i nomi presenti anche qui sono "
                         "considerati ambigui e scartati solo in sequenza (es. 'Mario Rossi')")
     f.add_argument("--keep", action="append", metavar="FILE",
-                   help="Termini da non trattare mai come nomi, es. etichette del gestionale (ripetibile)")
+                   help="Etichette da tenere sempre: mai trattate come nomi e mai assorbite in termini "
+                        "più lunghi (ripetibile)")
     f.add_argument("--ignore", action="append", metavar="FILE",
                    help="Termini da escludere sempre (ripetibile). Parola singola: esclude ogni termine che "
                         "la contiene; frase: esclude i termini che la contengono; 're:<regex>': espressione regolare")
@@ -740,7 +793,7 @@ def main():
                 continue
             parts = Path(r["rel"]).parts
             amb = parts[0] if len(parts) > 1 else "(root)"
-            for key, disp, conf, reason in extract_terms(group_lines(r["words"]), a):
+            for key, disp, conf, reason, standalone in extract_terms(group_lines(r["words"]), a):
                 if reason:
                     dd = dropped.setdefault(reason, {}).setdefault(
                         key, {"display": Counter(), "images": set(), "ambiti": set(), "count": 0})
@@ -751,15 +804,20 @@ def main():
                     dd["count"] += 1
                     continue
                 s = stats.setdefault(key, {"display": Counter(), "images": set(), "ambiti": set(),
-                                           "per_ambito": {}, "count": 0, "conf_sum": 0.0,
-                                           "example": r["rel"]})
+                                           "per_ambito": {}, "count": 0, "standalone": 0,
+                                           "conf_sum": 0.0, "example": r["rel"]})
                 s["display"][disp] += 1
                 s["images"].add(r["rel"])
                 s["ambiti"].add(amb)
                 s["per_ambito"].setdefault(amb, set()).add(r["rel"])
                 s["count"] += 1
+                s["standalone"] += standalone
                 s["conf_sum"] += conf
         dict_root = out_root / "dizionario" if a.mode == "entrambi" else out_root
+        if not a.no_collapse:
+            n_coll = collapse_subterms(stats, a.collapse_min, a.pii.keep_single, a.pii.keep_phrases)
+            print(f"[INFO] {n_coll} termini inclusi in termini più lunghi esclusi da dizionario.txt "
+                  "(restano in dizionario_termini.csv, colonna incluso_in)")
         n_sel, n_amb = write_dictionary(stats, dict_root, a.min_images)
         n_rev = write_pii_report(dropped, dict_root, a.min_images, a.review_names)
         summary = ", ".join(f"{k}: {len(v)}" for k, v in sorted(dropped.items())) or "nessuno"
