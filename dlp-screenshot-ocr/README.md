@@ -1,4 +1,4 @@
-# ocr_extract
+# dlp-screenshot-ocr
 
 Estrazione OCR **completamente locale** (Tesseract) da screenshot applicativi, con:
 
